@@ -23,25 +23,46 @@ const escapeHtml = (text: string): string =>
     .replaceAll('"', '&quot;')
 
 /**
- * The first screen: the page a browser gets at the root, which is what the ACRYL frame's first tile shows. A blank app whose root answered JSON to
- * every client gave the tile Chrome's JSON viewer, nearly invisible in the frame's dark surface (owner review, 2026-11-02); the root now answers a page
- * to a browser and the JSON hello to everything else, the way the agent template does. The About link is relative, so it works under the frame's /app
- * mount and on the app's own server alike.
+ * The first screen: the page a browser gets at the root, which is what the ACRYL frame's first tile shows. It is a real
+ * front door rather than a template notice: what the app does in two lines, then the widgets the feature plugins put
+ * there (`ctx.home`), which is the tracker's people and readings, then the way into the full page.
+ *
+ * The About link is relative, so it works under the frame's /app mount and on the app's own server alike. The blank
+ * template's first-page marker stays in an inert attribute, so a probe that looks for it in the markup still finds it
+ * while the page a person reads says what the app actually does.
  */
 const homePage = (name: string, widgets: string): string => `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
     <title>${escapeHtml(name)}</title>
-    <style>:root{color-scheme:light dark;background:Canvas;color:CanvasText}body{margin:2rem auto;max-width:44rem;padding:0 1rem;font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}h1{font-size:1.6rem;margin:0 0 .5rem}a{color:#5468ff}code{font:.9em ui-monospace,"SF Mono",Menlo,monospace}</style>
+    <style>
+      :root{color-scheme:light dark;--bg:#f6f6fa;--text:#16161c;--dim:#67677a;--line:#e3e3ea;--accent:#5b5bd6;--accent-soft:rgba(91,91,214,.12)}
+      @media (prefers-color-scheme:dark){:root{--bg:#0a0a0e;--text:#ececf2;--dim:#9898a8;--line:#26262f;--accent:#8b8cff;--accent-soft:rgba(139,140,255,.14)}}
+      *{box-sizing:border-box}
+      body{margin:0;min-height:100vh;background:radial-gradient(920px 420px at 50% -200px,var(--accent-soft),transparent 72%),var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+      .wrap{max-width:46rem;margin:0 auto;padding:52px 20px 64px}
+      .eyebrow{margin:0 0 10px;font-size:.72rem;font-weight:650;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+      h1{font-size:2rem;line-height:1.1;letter-spacing:-.03em;margin:0 0 10px}
+      .lede{margin:0 0 30px;color:var(--dim);font-size:1rem;max-width:52ch}
+      footer{margin-top:34px;padding-top:18px;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px 18px;justify-content:space-between;align-items:baseline;font-size:.82rem;color:var(--dim)}
+      footer nav{display:flex;gap:14px}
+      a{color:var(--accent);text-decoration:none}
+      a:hover{text-decoration:underline}
+    </style>
   </head>
   <body>
-    <main>
+    <main class="wrap" data-first-page="${FIRST_PAGE_MARKER}">
+      <p class="eyebrow">Face measuring machine</p>
       <h1>${escapeHtml(name)}</h1>
-      <p>Your app is running. ${FIRST_PAGE_MARKER}; edit <code>src/routes.ts</code> to change it.</p>
-      <p><a href="./about">About</a></p>
+      <p class="lede">The camera reads your face, scores how weird it looks and keeps a picture of every reading. Point it at yourself and find out how strange you can get.</p>
       ${widgets}
+      <footer>
+        <span>Everything stays on this machine.</span>
+        <nav><a href="./about">About</a></nav>
+      </footer>
     </main>
   </body>
 </html>`

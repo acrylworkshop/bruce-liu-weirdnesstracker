@@ -286,6 +286,25 @@ test('the home page shows the tracker widget with the latest readings', () =>
     assert.match(after, /Open the weirdness tracker/)
   }))
 
+test('the state carries the newest face of each person, so the rail and the widget can show it', () =>
+  withApp(async (app) => {
+    const shot = 'data:image/jpeg;base64,AAAA'
+    const answer = (await (await capture(app, ODD, face(3), shot)).json()) as { profile: { id: string } }
+    // A capture without a picture leaves the newest face alone rather than clearing it.
+    await capture(app, ODD, face(3))
+
+    const state = (await (await app.root.router.request('/weirdness/api/state')).json()) as {
+      profiles: { id: string; avatar: string | null; readings: unknown[] }[]
+    }
+    assert.equal(state.profiles[0].id, answer.profile.id)
+    assert.equal(state.profiles[0].avatar, shot)
+    assert.equal(state.profiles[0].readings.length, 2)
+
+    const home = await (await app.root.router.request('/', { headers: { accept: 'text/html' } })).text()
+    assert.match(home, /class="ws-face"/)
+    assert.ok(home.includes(shot), 'the widget shows the newest picture of the face')
+  }))
+
 test('the readings and the people survive a restart', async () => {
   const home = await mkdtemp(join(scratch, 'weirdness-restart-'))
   try {

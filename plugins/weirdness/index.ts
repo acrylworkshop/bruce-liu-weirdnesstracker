@@ -55,16 +55,91 @@ const recordOf = (input: unknown): Record<string, unknown> | null =>
     ? (input as Record<string, unknown>)
     : null
 
-/** A profile as the page reads it: the readings as `[when, score]` pairs, which is all the charts need. */
+/** The newest picture kept for a face, which is the one the page shows as an avatar. */
+function newestShot(profile: Profile): string | null {
+  for (let index = profile.readings.length - 1; index >= 0; index -= 1) {
+    const shot = profile.readings[index].shot
+    if (shot !== null) return shot
+  }
+  return null
+}
+
+/** A profile as the page reads it: the readings as `[when, score]` pairs, which is all the charts need, and a face to show. */
 function summary(profile: Profile) {
   return {
     id: profile.id,
     name: profile.name,
     createdAt: profile.createdAt,
     descriptors: profile.descriptors.length,
+    avatar: newestShot(profile),
     readings: profile.readings.map((reading) => [reading.at, reading.score]),
   }
 }
+
+/** Which colour a score is read in, on the page and in the home widget alike. */
+function bandOf(score: number): 'calm' | 'odd' | 'weird' {
+  return score < 25 ? 'calm' : score < 65 ? 'odd' : 'weird'
+}
+
+/** The word for which way a person's weirdness is going, true to how short the history is. */
+function directionOf(readings: readonly number[][]): string {
+  const stats = trend(readings.map((reading) => [Number(reading[0]), Number(reading[1])] as const))
+  if (stats.count < 2) return 'one reading'
+  if (stats.spanDays >= 2) {
+    if (stats.slopePerDay > 0.5) return 'getting weirder'
+    if (stats.slopePerDay < -0.5) return 'calming down'
+    return 'holding steady'
+  }
+  if (stats.r2 < 0.12 || Math.abs(stats.change) < 2) return 'bouncing around'
+  return stats.change > 0 ? 'weirder than the first' : 'calmer than the first'
+}
+
+/**
+ * The shape of a person's history as a tiny line: the home page gets a glance at the trend without a chart, and without
+ * a second request. Empty until there are two readings to join.
+ */
+function sparklineOf(readings: readonly number[][]): string {
+  if (readings.length < 2) return ''
+  const width = 44
+  const height = 14
+  const pad = 1.5
+  const recent = readings.slice(-40)
+  const scores = recent.map((reading) => Number(reading[1]))
+  const low = Math.min(...scores, 0)
+  const high = Math.max(...scores, 1)
+  const from = Number(recent[0][0])
+  const span = Math.max(1, Number(recent[recent.length - 1][0]) - from)
+  const points = recent.map((reading) => {
+    const x = pad + ((Number(reading[0]) - from) / span) * (width - pad * 2)
+    const y = height - pad - ((Number(reading[1]) - low) / Math.max(1, high - low)) * (height - pad * 2)
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  })
+  return `<svg class="ws-spark" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" aria-hidden="true"><polyline points="${points.join(' ')}" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/></svg>`
+}
+
+const WIDGET_STYLES = `<style data-weirdness-widget>
+.weirdness-summary{--ws-bg:var(--widget-bg);--ws-line:var(--widget-border);--ws-dim:var(--widget-dim);display:grid;gap:12px}
+.weirdness-summary .ws-list{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.weirdness-summary .ws-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--ws-line);border-radius:10px;background:var(--ws-bg)}
+.weirdness-summary .ws-face{width:30px;height:30px;border-radius:9px;background:var(--ws-line) center/cover no-repeat;display:grid;place-items:center;font-size:.72rem;font-weight:650;color:var(--ws-dim)}
+.weirdness-summary .ws-who{display:grid;gap:1px;min-width:0}
+.weirdness-summary .ws-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:7px}
+.weirdness-summary .ws-trend{font-weight:400;font-size:.72rem;color:var(--ws-dim)}
+.weirdness-summary .ws-meta{color:var(--ws-dim);font-size:.74rem;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:8px}
+.weirdness-summary .ws-spark{color:currentColor;flex:none;opacity:.8}
+.weirdness-summary .ws-score{font-weight:700;font-variant-numeric:tabular-nums;font-size:1.02rem}
+.weirdness-summary .ws-score.calm{color:#0f9d76}
+.weirdness-summary .ws-score.odd{color:#a86a00}
+.weirdness-summary .ws-score.weird{color:#cf2f63}
+.weirdness-summary .ws-foot{color:var(--ws-dim);font-size:.8rem}
+.weirdness-summary .ws-open{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:9px;background:var(--widget-accent);color:#fff;font-weight:550;text-decoration:none}
+.weirdness-summary .ws-open:hover{filter:brightness(1.08);text-decoration:none}
+@media (prefers-color-scheme:dark){
+  .weirdness-summary .ws-score.calm{color:#3ddcae}
+  .weirdness-summary .ws-score.odd{color:#f6c453}
+  .weirdness-summary .ws-score.weird{color:#ff7a9c}
+}
+</style>`
 
 function widget(store: Store): string {
   const state = store.state()
@@ -74,14 +149,19 @@ function widget(store: Store): string {
   const captures = state.profiles.reduce((sum, profile) => sum + profile.readings.length, 0)
   const rows = profiles.slice(0, 3).map((profile) => {
     const stats = trend(profile.readings)
-    const direction = stats.slopePerDay > 0.2 ? 'getting weirder' : stats.slopePerDay < -0.2 ? 'calming down' : 'holding steady'
-    return `<li><b>${escapeHtml(profile.name)}</b><span>latest <output>${stats.last.toFixed(1)}</output> · average ${stats.mean.toFixed(1)} · ${escapeHtml(direction)}</span></li>`
+    const readings = profile.readings.map((reading) => [reading.at, reading.score])
+    const face = newestShot(profile)
+    const direction = directionOf(readings)
+    const faceMark = face
+      ? `<span class="ws-face" style="background-image:url(&quot;${face}&quot;)" aria-hidden="true"></span>`
+      : `<span class="ws-face" aria-hidden="true">${escapeHtml(profile.name.slice(0, 1).toUpperCase())}</span>`
+    return `<li class="ws-row">${faceMark}<span class="ws-who"><span class="ws-name">${escapeHtml(profile.name)} <span class="ws-trend">${escapeHtml(direction)}</span></span><span class="ws-meta">${stats.count} capture${stats.count === 1 ? '' : 's'} · average ${stats.mean.toFixed(1)} ${sparklineOf(readings)}</span></span><span class="ws-score ${bandOf(stats.last)}">${stats.last.toFixed(1)}</span></li>`
   })
   const body =
     profiles.length === 0
       ? '<p>No faces yet. Open the tracker and let the camera look at you.</p>'
-      : `<ul>${rows.join('')}</ul><p>${captures} capture${captures === 1 ? '' : 's'} of ${profiles.length} ${profiles.length === 1 ? 'person' : 'people'}, all kept on this machine.</p>`
-  return `<div class="weirdness-summary">${body}<p><a id="weirdness-open" href="./weirdness">Open the weirdness tracker</a></p></div>
+      : `<ul class="ws-list">${rows.join('')}</ul><p class="ws-foot">${captures} capture${captures === 1 ? '' : 's'} of ${profiles.length} ${profiles.length === 1 ? 'person' : 'people'}, all kept on this machine.</p>`
+  return `${WIDGET_STYLES}<div class="weirdness-summary">${body}<p><a class="ws-open" id="weirdness-open" href="./weirdness">Open the weirdness tracker <span aria-hidden="true">→</span></a></p></div>
 <script type="module">
   const link = document.getElementById('weirdness-open')
   if (link) link.setAttribute('href', location.pathname.replace(/\\/+$/, '') + '/weirdness')

@@ -3,10 +3,15 @@
  *
  * face-api (vendored in `assets/`, MIT) finds a face in the camera picture, reads its 68 landmarks and, on a capture,
  * computes the 128 number descriptor that identifies the person. The browser scores the live picture with the same
- * `score.js` the server records with, so the number on the badge is the number that gets saved.
+ * `score.js` the server records with, so the number on the readout is the number that gets saved.
  *
  * Every URL here is resolved against `base`, this page's own address with a trailing slash, so the same code works at
  * `/weirdness` on the app's own server and at `/app/weirdness` in the ACRYL frame.
+ *
+ * The page is a stage and a review. The stage (left) is the camera, the live number, the eight things driving it and the
+ * capture settings; it stays short. The review (right) is a rail of people and one card about the selected person, with
+ * two tabs (history, compare). Nothing that changes a person's data is repeated per row, which is what keeps ten people
+ * readable.
  */
 // The version the page gave this module rides along to the math beside it, so an edited score.js is not served from a cache.
 const version = new URL(import.meta.url).searchParams.get('v') ?? ''
@@ -19,27 +24,69 @@ const byId = (id) => document.getElementById(id)
 const video = byId('video')
 const photo = byId('photo')
 const overlay = byId('overlay')
-const badge = byId('badge')
+const placeholder = byId('placeholder')
+const readout = byId('readout')
 const liveScore = byId('live-score')
+const liveVerdict = byId('live-verdict')
 const noticeBox = byId('notice')
 const statusLine = byId('status')
 const flashBox = byId('flash')
+const modelChip = byId('model-chip')
+const modeChip = byId('mode-chip')
+const modeLabel = byId('mode-label')
+const startButton = byId('start')
+const startLabel = byId('start-label')
+const snapButton = byId('snap')
 const peopleList = byId('people')
+const peopleCount = byId('people-count')
+const factorsBox = byId('factors')
+const driversHint = byId('drivers-hint')
+const renameInput = byId('rename')
+const detailAvatar = byId('detail-avatar')
+const detailMeta = byId('detail-meta')
+const personMenu = byId('person-menu')
+const mergeSelect = byId('merge')
+const deleteButton = byId('delete')
+const tabHistory = byId('tab-history')
+const tabCompare = byId('tab-compare')
+const panelHistory = byId('panel-history')
+const panelCompare = byId('panel-compare')
+const compareCount = byId('compare-count')
 const statsBox = byId('stats')
+const verdictLine = byId('verdict-line')
+const verdictHeadline = byId('verdict-headline')
+const verdictDetail = byId('verdict-detail')
 const historyChart = byId('history-chart')
 const compareChart = byId('compare-chart')
 const compareTable = byId('compare-table')
 const shotsBox = byId('shots')
-const factorsBox = byId('factors')
-const historyTitle = byId('history-title')
+const shotsHint = byId('shots-hint')
+const settingsHint = byId('settings-hint')
 
 const COLORS = ['#7c8cff', '#4dd4ac', '#ffd166', '#ff8fab', '#a78bfa', '#66c2ff']
+const PROFILE_COLOR = COLORS[0]
+
+/** What a number means in words: a score is easier to trust with a label beside it. */
+const BANDS = [
+  { upTo: 10, key: 'calm', label: 'suspiciously normal' },
+  { upTo: 25, key: 'calm', label: 'almost normal' },
+  { upTo: 45, key: 'odd', label: 'mildly weird' },
+  { upTo: 65, key: 'weird', label: 'properly weird' },
+  { upTo: Number.POSITIVE_INFINITY, key: 'weird', label: 'deeply weird' },
+]
+
+function bandOf(score) {
+  for (const band of BANDS) if (score < band.upTo) return band
+  return BANDS[BANDS.length - 1]
+}
 
 const view = {
   settings: { intervalSec: 5, matchThreshold: 0.6, sound: true },
   profiles: [],
   selected: null,
   compare: new Set(),
+  tab: 'history',
+  shotsFor: null,
   faceapi: null,
   options: null,
   stream: null,
@@ -94,6 +141,14 @@ function element(tag, className, text) {
   return node
 }
 
+const SVG = 'http://www.w3.org/2000/svg'
+
+function svgNode(tag, attributes) {
+  const node = document.createElementNS(SVG, tag)
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value))
+  return node
+}
+
 let statusHold = 0
 
 function setStatus(message) {
@@ -118,11 +173,12 @@ function flash(message) {
   clearTimeout(flashTimer)
   flashTimer = setTimeout(() => {
     flashBox.hidden = true
-  }, 6000)
+  }, 7000)
 }
 
 const score1 = (value) => (Number.isFinite(value) ? value.toFixed(1) : '0.0')
 const percent = (value) => `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%`
+const signed = (value) => `${value > 0 ? '+' : ''}${score1(value)}`
 
 function when(at) {
   return new Date(at).toLocaleString(undefined, {
@@ -131,6 +187,48 @@ function when(at) {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+/** "40 min", "1.5 hours", "3 days": how long a history covers, in the unit that reads best. */
+function spanText(days) {
+  const minutes = days * 1440
+  if (!Number.isFinite(minutes) || minutes < 1) return 'under a minute'
+  if (minutes < 90) return `${Math.round(minutes)} min`
+  if (days < 2) return `${(minutes / 60).toFixed(1).replace(/\.0$/u, '')} hours`
+  return `${days.toFixed(days < 10 ? 1 : 0).replace(/\.0$/u, '')} days`
+}
+
+/**
+ * What the readings say, in words that stay true. A session of two hundred captures in half an hour has a huge
+ * "points per day" slope and a line that fits nothing, so the rate is quoted per hour there and a flat, noisy series is
+ * called what it is instead of inventing a direction.
+ */
+function describeTrend(stats) {
+  if (stats.count === 0) return { headline: 'No readings yet', detail: 'Capture a face to start the history.', tone: 'flat' }
+  if (stats.count === 1) return { headline: 'One reading so far', detail: 'Two or more readings show which way this is going.', tone: 'flat' }
+  const span = spanText(stats.spanDays)
+  const change = stats.change
+  const slopePerHour = stats.slopePerDay / 24
+  const noisy = stats.r2 < 0.12
+  if (noisy || Math.abs(slopePerHour) < 0.05) {
+    return {
+      headline: Math.abs(change) < 2 ? 'Holding steady' : 'No clear direction',
+      detail:
+        Math.abs(change) < 2
+          ? `${stats.count} readings over ${span}, all around the same level. Average ${score1(stats.mean)}.`
+          : `${stats.count} readings over ${span}, moving up and down without a trend. Average ${score1(stats.mean)}.`,
+      tone: 'flat',
+    }
+  }
+  const rate =
+    stats.spanDays >= 2
+      ? `${score1(Math.abs(stats.slopePerDay))} points a day`
+      : `${score1(Math.abs(slopePerHour))} points an hour`
+  return {
+    headline: change > 0 ? 'Getting weirder' : 'Calming down',
+    detail: `About ${rate} over ${span}, from ${score1(stats.first)} to ${score1(stats.last)}.`,
+    tone: change > 0 ? 'up' : 'down',
+  }
 }
 
 function describe(error) {
@@ -193,9 +291,9 @@ function beep(frequency, { to = 0, length = 0.1, type = 'triangle', gain = 0.05,
  */
 const sounds = {
   capture(score) {
-    const base = 280 + Math.min(100, Math.max(0, score)) * 6
-    beep(base, { length: 0.09, gain: 0.05 })
-    beep(base * 1.5, { length: 0.11, gain: 0.045, delay: 0.075 })
+    const root = 280 + Math.min(100, Math.max(0, score)) * 6
+    beep(root, { length: 0.09, gain: 0.05 })
+    beep(root * 1.5, { length: 0.11, gain: 0.045, delay: 0.075 })
   },
   newPerson() {
     beep(523, { length: 0.1, gain: 0.05 })
@@ -232,39 +330,38 @@ function renderSound() {
 
 /* ---------- charts ---------- */
 
-const SVG = 'http://www.w3.org/2000/svg'
+let chartSeq = 0
 
-function svgNode(tag, attributes) {
-  const node = document.createElementNS(SVG, tag)
-  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value))
-  return node
-}
-
-/** A 0..100 line chart of one or more histories: the raw readings faint, the smoothed line bold, time along the bottom. */
-function drawChart(container, series, height = 170) {
+/**
+ * A 0..100 line chart of one or more histories: the raw readings faint, the smoothed line bold over a soft fill, time
+ * along the bottom, and a readout of the nearest reading under the pointer. The aria-label carries the same summary as
+ * text, so the chart is not a picture with no content.
+ */
+function drawChart(container, series, options = {}) {
   container.replaceChildren()
-  const points = series.flatMap((item) => item.points)
-  if (points.length === 0) {
-    container.append(element('p', 'empty', 'Nothing to chart yet.'))
+  const all = series.flatMap((item) => item.points)
+  if (all.length === 0) {
+    container.append(element('p', 'empty', options.empty ?? 'Nothing to chart yet.'))
     return
   }
-  const width = Math.max(260, Math.round(container.clientWidth || 320))
-  const pad = { left: 30, right: 6, top: 8, bottom: 18 }
-  const plotWidth = width - pad.left - pad.right
+  const width = Math.max(240, Math.round(container.clientWidth || 340))
+  const height = options.height ?? 190
+  const pad = { left: 32, right: 12, top: 12, bottom: 22 }
+  const plotWidth = Math.max(40, width - pad.left - pad.right)
   const plotHeight = height - pad.top - pad.bottom
-  const from = Math.min(...points.map((point) => point.at))
-  const to = Math.max(...points.map((point) => point.at))
+  const from = Math.min(...all.map((point) => point.at))
+  const to = Math.max(...all.map((point) => point.at))
   const span = Math.max(1, to - from)
   const x = (at) => pad.left + ((at - from) / span) * plotWidth
-  const y = (score) => pad.top + (1 - Math.min(100, Math.max(0, score)) / 100) * plotHeight
+  const y = (value) => pad.top + (1 - Math.min(100, Math.max(0, value)) / 100) * plotHeight
+  const seq = (chartSeq += 1)
+  const scores = all.map((point) => point.score)
+  const summary =
+    `${series.map((item) => item.name).join(' and ')}: ${all.length} readings from ${when(from)} to ${when(to)}, ` +
+    `between ${score1(Math.min(...scores))} and ${score1(Math.max(...scores))} weirdness.`
+  const root = svgNode('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': summary })
+  const defs = svgNode('defs', {})
 
-  const root = svgNode('svg', {
-    viewBox: `0 0 ${width} ${height}`,
-    width,
-    height,
-    role: 'img',
-    'aria-label': `Weirdness over time for ${series.map((item) => item.name).join(', ')}`,
-  })
   for (const level of [0, 25, 50, 75, 100]) {
     root.append(
       svgNode('line', {
@@ -273,69 +370,146 @@ function drawChart(container, series, height = 170) {
         y1: y(level),
         y2: y(level),
         stroke: 'currentColor',
-        'stroke-opacity': level === 0 ? 0.35 : 0.12,
+        'stroke-opacity': level === 0 ? 0.32 : 0.1,
         'stroke-width': 1,
       }),
     )
     const label = svgNode('text', {
-      x: pad.left - 6,
+      x: pad.left - 7,
       y: y(level) + 3.5,
       'text-anchor': 'end',
       'font-size': 9,
       fill: 'currentColor',
-      'fill-opacity': 0.55,
+      'fill-opacity': 0.5,
     })
     label.textContent = String(level)
     root.append(label)
   }
-  for (const item of series) {
-    if (item.points.length === 0) continue
-    const path = item.points.map((point) => `${x(point.at).toFixed(1)},${y(point.score).toFixed(1)}`)
+
+  series.forEach((item, index) => {
+    if (item.points.length === 0) return
+    const points = [...item.points].sort((a, b) => a.at - b.at)
+    const smooth = movingAverage(points, 5)
+    const gradientId = `weirdness-fill-${seq}-${index}`
+    const gradient = svgNode('linearGradient', { id: gradientId, x1: 0, y1: 0, x2: 0, y2: 1 })
+    gradient.append(
+      svgNode('stop', { offset: '0%', 'stop-color': item.color, 'stop-opacity': 0.26 }),
+      svgNode('stop', { offset: '100%', 'stop-color': item.color, 'stop-opacity': 0 }),
+    )
+    defs.append(gradient)
+    const line = smooth.map((point, order) => `${order === 0 ? 'M' : 'L'}${x(point.at).toFixed(1)} ${y(point.score).toFixed(1)}`).join(' ')
+    const area = `${line} L${x(smooth[smooth.length - 1].at).toFixed(1)} ${y(0).toFixed(1)} L${x(smooth[0].at).toFixed(1)} ${y(0).toFixed(1)} Z`
+    if (series.length === 1) root.append(svgNode('path', { d: area, fill: `url(#${gradientId})`, stroke: 'none' }))
     root.append(
       svgNode('polyline', {
-        points: path.join(' '),
+        points: points.map((point) => `${x(point.at).toFixed(1)},${y(point.score).toFixed(1)}`).join(' '),
         fill: 'none',
         stroke: item.color,
-        'stroke-width': 1.25,
-        'stroke-opacity': 0.35,
+        'stroke-width': 1.1,
+        'stroke-opacity': 0.28,
         'stroke-linejoin': 'round',
       }),
     )
-    const smooth = movingAverage(item.points, 5)
     root.append(
-      svgNode('polyline', {
-        points: smooth.map((point) => `${x(point.at).toFixed(1)},${y(point.score).toFixed(1)}`).join(' '),
+      svgNode('path', {
+        d: line,
         fill: 'none',
         stroke: item.color,
-        'stroke-width': 2.2,
+        'stroke-width': 2.1,
         'stroke-linejoin': 'round',
         'stroke-linecap': 'round',
       }),
     )
-    if (item.points.length === 1) {
-      root.append(svgNode('circle', { cx: x(item.points[0].at), cy: y(item.points[0].score), r: 3, fill: item.color }))
-    }
-  }
-  const firstLabel = svgNode('text', {
-    x: pad.left,
-    y: height - 3,
-    'font-size': 9,
-    fill: 'currentColor',
-    'fill-opacity': 0.55,
+    const last = smooth[smooth.length - 1]
+    root.append(
+      svgNode('circle', { cx: x(last.at), cy: y(last.score), r: 4.5, fill: item.color, 'fill-opacity': 0.18 }),
+      svgNode('circle', { cx: x(last.at), cy: y(last.score), r: 2.6, fill: item.color, stroke: 'currentColor', 'stroke-width': 1.2 }),
+    )
   })
+
+  const firstLabel = svgNode('text', { x: pad.left, y: height - 4, 'font-size': 9, fill: 'currentColor', 'fill-opacity': 0.5 })
   firstLabel.textContent = when(from)
+  root.append(firstLabel)
+  if (span > 60_000 && plotWidth > 230) {
+    const middleLabel = svgNode('text', {
+      x: pad.left + plotWidth / 2,
+      y: height - 4,
+      'text-anchor': 'middle',
+      'font-size': 9,
+      fill: 'currentColor',
+      'fill-opacity': 0.4,
+    })
+    middleLabel.textContent = when(from + span / 2)
+    root.append(middleLabel)
+  }
   const lastLabel = svgNode('text', {
     x: pad.left + plotWidth,
-    y: height - 3,
+    y: height - 4,
     'text-anchor': 'end',
     'font-size': 9,
     fill: 'currentColor',
-    'fill-opacity': 0.55,
+    'fill-opacity': 0.5,
   })
   lastLabel.textContent = when(to)
-  root.append(firstLabel, lastLabel)
-  container.append(root)
+  root.append(lastLabel, defs)
 
+  const cursor = svgNode('line', {
+    y1: pad.top,
+    y2: pad.top + plotHeight,
+    stroke: 'currentColor',
+    'stroke-opacity': 0.3,
+    'stroke-dasharray': '3 3',
+    'stroke-width': 1,
+  })
+  cursor.style.opacity = '0'
+  root.append(cursor)
+
+  const tip = element('div', 'tip')
+  const ordered = series
+    .map((item) => ({ name: item.name, color: item.color, points: [...item.points].sort((a, b) => a.at - b.at) }))
+    .filter((item) => item.points.length > 0)
+
+  root.addEventListener('pointermove', (event) => {
+    const rect = root.getBoundingClientRect()
+    if (rect.width === 0) return
+    const px = Math.min(pad.left + plotWidth, Math.max(pad.left, ((event.clientX - rect.left) / rect.width) * width))
+    const at = from + ((px - pad.left) / plotWidth) * span
+    const nearest = []
+    for (const item of ordered) {
+      let best = null
+      for (const point of item.points) {
+        if (best === null || Math.abs(point.at - at) < Math.abs(best.at - at)) best = point
+      }
+      if (best !== null) nearest.push({ ...item, point: best })
+    }
+    if (nearest.length === 0) return
+    const spotlight = nearest.reduce((closest, item) => (item.point.at < closest.point.at ? item : closest), nearest[0])
+    cursor.setAttribute('x1', x(spotlight.point.at))
+    cursor.setAttribute('x2', x(spotlight.point.at))
+    cursor.style.opacity = '1'
+    tip.replaceChildren(element('span', 'tiptime', when(spotlight.point.at)))
+    for (const item of nearest) {
+      const line = element('div')
+      if (series.length > 1) {
+        const dot = element('i')
+        dot.style.cssText = `display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:5px;background:${item.color}`
+        line.append(dot)
+        line.append(document.createTextNode(`${item.name} `))
+      }
+      line.append(element('b', undefined, score1(item.point.score)))
+      tip.append(line)
+    }
+    const topPoint = nearest.reduce((low, item) => (y(item.point.score) < y(low.point.score) ? item : low), nearest[0])
+    tip.style.left = `${(x(spotlight.point.at) / width) * 100}%`
+    tip.style.top = `${(y(topPoint.point.score) / height) * 100}%`
+    tip.classList.add('on')
+  })
+  root.addEventListener('pointerleave', () => {
+    cursor.style.opacity = '0'
+    tip.classList.remove('on')
+  })
+
+  container.append(root, tip)
   if (series.length > 1) {
     const legend = element('div', 'legend')
     for (const item of series) {
@@ -349,184 +523,206 @@ function drawChart(container, series, height = 170) {
   }
 }
 
+/** A person's history as a tiny line, the way the rail shows a shape without a chart. */
+function sparkline(readings, band) {
+  const points = readings.slice(-40).map(([at, score]) => ({ at, score }))
+  const width = 46
+  const height = 18
+  const padding = 2
+  const values = points.map((point) => point.score)
+  let low = Math.min(...values)
+  let high = Math.max(...values)
+  // A flat history is a line through the middle, not a line on the floor.
+  if (high - low < 1) {
+    low -= 1
+    high += 1
+  }
+  const span = Math.max(1, points[points.length - 1].at - points[0].at)
+  const x = (at) => padding + ((at - points[0].at) / span) * (width - padding * 2)
+  const y = (score) => height - padding - ((score - low) / (high - low)) * (height - padding * 2)
+  const svg = svgNode('svg', { viewBox: `0 0 ${width} ${height}`, width, height, class: `spark band-${band}`, 'aria-hidden': 'true' })
+  if (points.length === 1) {
+    svg.append(svgNode('circle', { cx: width / 2, cy: y(points[0].score), r: 2, fill: 'currentColor' }))
+    return svg
+  }
+  svg.append(
+    svgNode('polyline', {
+      points: points.map((point) => `${x(point.at).toFixed(1)},${y(point.score).toFixed(1)}`).join(' '),
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': 1.4,
+      'stroke-linejoin': 'round',
+      'stroke-linecap': 'round',
+    }),
+  )
+  return svg
+}
+
 /* ---------- rendering ---------- */
 
 function profileById(id) {
   return view.profiles.find((profile) => profile.id === id)
 }
 
-function latest(profile) {
+function latestAt(profile) {
   return profile.readings.length ? profile.readings[profile.readings.length - 1][0] : 0
 }
 
+function initial(name) {
+  return (name || '?').trim().slice(0, 1).toUpperCase()
+}
+
+/** An avatar: the newest picture of that face, or the first letter when there is no picture yet. */
+function avatarNode(profile) {
+  const node = element('span', 'avatar')
+  if (profile.avatar) node.style.backgroundImage = `url("${profile.avatar}")`
+  else node.textContent = initial(profile.name)
+  return node
+}
+
 function renderPeople() {
-  const focused = document.activeElement
-  if (focused && focused.classList && focused.classList.contains('name')) return
   peopleList.replaceChildren()
+  peopleCount.textContent = String(view.profiles.length)
   if (view.profiles.length === 0) {
-    peopleList.append(element('li', 'empty', 'No one yet. Start the camera and the first face becomes Person 1.'))
+    peopleList.append(
+      element('li', 'people-empty', 'No one yet. Start the camera and the first face becomes Person 1.'),
+    )
     return
   }
   for (const profile of view.profiles) {
     const stats = trend(profile.readings)
-    const row = element('li', 'person' + (profile.id === view.selected ? ' active' : ''))
-    row.dataset.id = profile.id
-
-    const pick = element('label', 'pick')
-    pick.title = 'Overlay this person in the comparison'
-    const box = document.createElement('input')
-    box.type = 'checkbox'
-    box.dataset.act = 'compare'
-    box.checked = view.compare.has(profile.id)
-    box.setAttribute('aria-label', `Compare ${profile.name}`)
-    pick.append(box)
-
-    const body = element('div')
-    const name = document.createElement('input')
-    name.className = 'name'
-    name.value = profile.name
-    name.dataset.act = 'name'
-    name.maxLength = 40
-    name.setAttribute('aria-label', 'Name of this person')
-    const meta = element(
-      'span',
-      'meta',
-      `${stats.count} capture${stats.count === 1 ? '' : 's'} · average ${score1(stats.mean)} · latest ${score1(stats.last)}`,
+    const band = bandOf(stats.count > 0 ? stats.last : 0)
+    const selected = profile.id === view.selected
+    const row = element('button', 'row')
+    row.type = 'button'
+    row.dataset.act = 'select'
+    row.setAttribute('aria-pressed', selected ? 'true' : 'false')
+    row.title = `Show ${profile.name}`
+    row.append(avatarNode(profile))
+    const who = element('span', 'who')
+    who.append(
+      element('span', 'pname', profile.name),
+      element('span', 'pmeta', `${stats.count} capture${stats.count === 1 ? '' : 's'} · avg ${score1(stats.mean)}`),
     )
-    body.append(name, meta)
+    row.append(who)
+    if (profile.readings.length > 1) row.append(sparkline(profile.readings, band.key))
+    row.append(element('span', `pscore band-${band.key}`, stats.count > 0 ? score1(stats.last) : '–'))
 
-    const merge = document.createElement('select')
-    merge.className = 'merge'
-    merge.dataset.act = 'merge'
-    merge.setAttribute('aria-label', `Merge ${profile.name} into another person`)
-    merge.append(new Option('Merge into…', ''))
-    for (const other of view.profiles) {
-      if (other.id !== profile.id) merge.append(new Option(other.name, other.id))
-    }
+    const compare = document.createElement('input')
+    compare.type = 'checkbox'
+    compare.className = 'cmp'
+    compare.dataset.act = 'compare'
+    compare.checked = view.compare.has(profile.id)
+    compare.setAttribute('aria-label', `Compare ${profile.name}`)
+    compare.title = `Compare ${profile.name}`
 
-    const drop = element('button', 'drop', '×')
-    drop.dataset.act = 'delete'
-    drop.title = `Delete ${profile.name} and their readings`
-
-    row.append(pick, body, merge, drop)
-    peopleList.append(row)
+    const item = element('li', `person${selected ? ' is-selected' : ''}`)
+    item.dataset.id = profile.id
+    item.append(row, compare)
+    peopleList.append(item)
   }
 }
 
-function renderStats() {
+function renderTabs() {
+  const history = view.tab === 'history'
+  const chosen = view.profiles.filter((profile) => view.compare.has(profile.id)).length
+  compareCount.textContent = String(chosen)
+  compareCount.hidden = chosen === 0
+  tabHistory.setAttribute('aria-selected', history ? 'true' : 'false')
+  tabCompare.setAttribute('aria-selected', history ? 'false' : 'true')
+  tabHistory.tabIndex = history ? 0 : -1
+  tabCompare.tabIndex = history ? -1 : 0
+  panelHistory.hidden = !history
+  panelCompare.hidden = history
+}
+
+function renderHeader(profile) {
+  const disabled = profile === undefined
+  renameInput.disabled = disabled
+  renameInput.placeholder = disabled ? 'No one selected' : 'Name this person'
+  if (document.activeElement !== renameInput) renameInput.value = profile ? profile.name : ''
+  if (profile) {
+    if (profile.avatar) {
+      detailAvatar.style.backgroundImage = `url("${profile.avatar}")`
+      detailAvatar.textContent = ''
+    } else {
+      detailAvatar.style.backgroundImage = ''
+      detailAvatar.textContent = initial(profile.name)
+    }
+    detailMeta.textContent = profile.readings.length
+      ? `${profile.readings.length} capture${profile.readings.length === 1 ? '' : 's'} · first seen ${when(profile.createdAt)}`
+      : 'No readings yet.'
+  } else {
+    detailAvatar.style.backgroundImage = ''
+    detailAvatar.textContent = '?'
+    detailMeta.textContent = 'Capture a face to start the history.'
+  }
+  mergeSelect.replaceChildren(new Option(disabled ? 'Nothing to merge' : 'Merge into…', ''))
+  for (const other of view.profiles) {
+    if (other.id !== view.selected) mergeSelect.append(new Option(other.name, other.id))
+  }
+  mergeSelect.disabled = disabled || view.profiles.length < 2
+  deleteButton.disabled = disabled
+}
+
+function renderHistory(profile) {
   statsBox.replaceChildren()
-  const profile = profileById(view.selected)
   if (profile === undefined) {
-    statsBox.append(element('div', 'empty', 'A person appears here once a face has been captured.'))
-    historyTitle.textContent = 'History'
-    historyChart.replaceChildren()
+    statsBox.append(element('p', 'stats-empty', 'No one yet. Start the camera and the first face becomes Person 1.'))
+    verdictLine.className = 'verdict-line'
+    verdictHeadline.textContent = 'No readings yet'
+    verdictDetail.textContent = 'A person appears here once a face has been captured.'
+    const empty = element('p', 'empty', 'A line appears here after the first capture.')
+    historyChart.replaceChildren(empty)
     return
   }
-  historyTitle.textContent = `History · ${profile.name}`
   const stats = trend(profile.readings)
-  const verdict =
-    stats.count < 2
-      ? 'one reading so far'
-      : stats.slopePerDay > 0.2
-        ? `getting weirder by ${score1(stats.slopePerDay)} points a day`
-        : stats.slopePerDay < -0.2
-          ? `calming down by ${score1(Math.abs(stats.slopePerDay))} points a day`
-          : 'holding steady'
-  const rows = [
-    ['Latest', score1(stats.last)],
-    ['Average', score1(stats.mean)],
-    ['Peak', score1(stats.max)],
-    ['Total points', score1(stats.total)],
+  const tiles = [
+    ['Latest', stats.count > 0 ? score1(stats.last) : '–'],
+    ['Average', stats.count > 0 ? score1(stats.mean) : '–'],
+    ['Peak', stats.count > 0 ? score1(stats.max) : '–'],
     ['Captures', String(stats.count)],
-    ['Change a day', `${stats.slopePerDay > 0 ? '+' : ''}${score1(stats.slopePerDay)}`],
-    ['Since first', `${stats.change > 0 ? '+' : ''}${score1(stats.change)}`],
-    ['Trend', `${verdict} (fit ${stats.r2.toFixed(2)})`],
-    ['Covering', `${stats.spanDays.toFixed(1)} days`],
   ]
-  for (const [label, value] of rows) {
-    const cell = element('div')
+  for (const [label, value] of tiles) {
+    const cell = element('div', 'stat')
     cell.append(element('dt', undefined, label), element('dd', undefined, value))
     statsBox.append(cell)
   }
-  drawChart(historyChart, [
-    { name: profile.name, color: COLORS[0], points: profile.readings.map(([at, score]) => ({ at, score })) },
-  ])
+  const verdict = describeTrend(stats)
+  verdictLine.className = `verdict-line${verdict.tone === 'up' ? ' up' : verdict.tone === 'down' ? ' down' : ''}`
+  verdictHeadline.textContent = verdict.headline
+  verdictDetail.textContent = verdict.detail
+  drawChart(
+    historyChart,
+    [
+      {
+        name: profile.name,
+        color: PROFILE_COLOR,
+        points: profile.readings.map(([at, score]) => ({ at, score })),
+      },
+    ],
+    { height: 190, empty: 'A line appears here after the first capture.' },
+  )
 }
 
-function renderCompare() {
-  for (const id of [...view.compare]) {
-    if (profileById(id) === undefined) view.compare.delete(id)
-  }
-  const chosen = view.profiles.filter((profile) => view.compare.has(profile.id))
-  const selected = profileById(view.selected)
-  const shown = chosen.length > 0 ? chosen : selected === undefined ? [] : [selected]
-  drawChart(
-    compareChart,
-    shown.map((profile, index) => ({
-      name: profile.name,
-      color: COLORS[index % COLORS.length],
-      points: profile.readings.map(([at, score]) => ({ at, score })),
-    })),
-  )
-
-  compareTable.replaceChildren()
-  if (view.profiles.length === 0) {
-    compareTable.append(element('p', 'empty', 'Compare people once there are two of them.'))
+async function renderShots(profile) {
+  shotsBox.replaceChildren()
+  if (profile === undefined) {
+    shotsHint.textContent = 'The newest 24 are kept'
     return
   }
-  const rows = view.profiles
-    .map((profile) => ({ profile, stats: trend(profile.readings) }))
-    .sort((a, b) => b.stats.mean - a.stats.mean)
-  const table = element('table')
-  const head = element('thead')
-  const headRow = element('tr')
-  for (const label of ['Person', 'Average', 'Latest', 'A day', 'Since first']) {
-    headRow.append(element('th', undefined, label))
-  }
-  head.append(headRow)
-  const body = element('tbody')
-  for (const { profile, stats } of rows) {
-    const row = element('tr')
-    const nameCell = element('td', undefined, profile.name)
-    if (profile.id === view.selected) nameCell.style.color = 'var(--accent)'
-    row.append(
-      nameCell,
-      element('td', undefined, score1(stats.mean)),
-      element('td', undefined, score1(stats.last)),
-      element('td', undefined, `${stats.slopePerDay > 0 ? '+' : ''}${score1(stats.slopePerDay)}`),
-      element('td', undefined, `${stats.change > 0 ? '+' : ''}${score1(stats.change)}`),
-    )
-    body.append(row)
-  }
-  table.append(head, body)
-  compareTable.append(table)
-}
-
-function renderFactors(parts) {
-  factorsBox.replaceChildren()
-  if (!parts) return
-  for (const part of parts) {
-    const card = element('div', 'factor')
-    const bar = element('i')
-    bar.style.width = percent(part.value)
-    card.append(element('b', undefined, part.label), bar, element('em', undefined, percent(part.value)))
-    factorsBox.append(card)
-  }
-}
-
-async function renderShots() {
-  const profile = profileById(view.selected)
-  shotsBox.replaceChildren()
-  if (profile === undefined) return
+  const id = profile.id
   let shots = []
   try {
-    const response = await fetch(api(`api/profiles/${encodeURIComponent(profile.id)}/shots?limit=12`))
+    const response = await fetch(api(`api/profiles/${encodeURIComponent(id)}/shots?limit=12`))
     if (response.ok) shots = (await response.json()).shots
   } catch {
     shots = []
   }
+  if (view.selected !== id) return
+  shotsHint.textContent = shots.length === 0 ? 'The newest 24 are kept' : `${shots.length} of ${profile.readings.length}`
   if (shots.length === 0) {
-    shotsBox.append(element('p', 'empty', 'No pictures yet (the newest 24 are kept, the rest age out).'))
+    shotsBox.append(element('p', 'empty', 'No pictures kept yet. The newest 24 are kept, the rest age out.'))
     return
   }
   for (const shot of shots) {
@@ -540,11 +736,80 @@ async function renderShots() {
   }
 }
 
-function renderAll() {
-  renderPeople()
-  renderStats()
-  renderCompare()
-  renderShots()
+function renderCompare() {
+  const chosen = view.profiles.filter((profile) => view.compare.has(profile.id))
+  if (chosen.length === 0) {
+    drawChart(compareChart, [], {
+      empty: 'Tick the box beside two or more people in the list, and their lines appear here.',
+    })
+  } else {
+    drawChart(
+      compareChart,
+      chosen.map((profile, index) => ({
+        name: profile.name,
+        color: COLORS[index % COLORS.length],
+        points: profile.readings.map(([at, score]) => ({ at, score })),
+      })),
+      { height: 190 },
+    )
+  }
+
+  compareTable.replaceChildren()
+  if (view.profiles.length === 0) {
+    compareTable.append(element('p', 'empty', 'Compare people once there are two of them.'))
+    return
+  }
+  const rows = view.profiles
+    .map((profile) => ({ profile, stats: trend(profile.readings) }))
+    .sort((a, b) => b.stats.mean - a.stats.mean)
+  const table = element('table')
+  const head = element('thead')
+  const headRow = element('tr')
+  for (const label of ['Person', 'Average', 'Latest', 'Change', 'Captures']) {
+    headRow.append(element('th', undefined, label))
+  }
+  head.append(headRow)
+  const body = element('tbody')
+  for (const { profile, stats } of rows) {
+    const row = element('tr')
+    if (profile.id === view.selected) row.className = 'is-selected'
+    if (view.compare.has(profile.id)) row.style.background = 'var(--accent-soft)'
+    row.append(
+      element('td', undefined, profile.name),
+      element('td', undefined, stats.count > 0 ? score1(stats.mean) : '–'),
+      element('td', undefined, stats.count > 0 ? score1(stats.last) : '–'),
+      element('td', undefined, stats.count > 1 ? signed(stats.change) : '–'),
+      element('td', undefined, String(stats.count)),
+    )
+    body.append(row)
+  }
+  table.append(head, body)
+  compareTable.append(table)
+}
+
+function renderFactors(parts) {
+  factorsBox.replaceChildren()
+  if (!parts || parts.length === 0) {
+    driversHint.textContent = 'Waiting for a face'
+    factorsBox.append(element('li', 'factors-empty', 'The eight measurements behind the number show up once a face is in view.'))
+    return
+  }
+  driversHint.textContent = 'How far each one goes'
+  const sorted = [...parts].sort((a, b) => b.share - a.share)
+  sorted.forEach((part, index) => {
+    const item = element('li', `factor${index < 3 ? ' top' : ''}`)
+    const bar = element('i')
+    bar.style.width = percent(part.value)
+    const track = element('span', 'fbar')
+    track.append(bar)
+    item.title = `${part.label}: ${percent(part.value)} of the way to the top, ${Math.round(part.weight * 100)}% of the score`
+    item.append(
+      element('span', 'flabel', part.label),
+      element('span', 'fval', percent(part.value)),
+      track,
+    )
+    factorsBox.append(item)
+  })
 }
 
 function renderSettings() {
@@ -554,14 +819,40 @@ function renderSettings() {
   const threshold = byId('threshold')
   threshold.value = String(view.settings.matchThreshold)
   byId('threshold-out').textContent = view.settings.matchThreshold.toFixed(2)
+  settingsHint.textContent = `${view.settings.intervalSec > 0 ? `every ${view.settings.intervalSec}s` : 'only by hand'} · same person under ${view.settings.matchThreshold.toFixed(2)} · sound ${view.settings.sound ? 'on' : 'off'}`
   renderSound()
 }
 
-/* ---------- profiles ---------- */
+function renderAll() {
+  const profile = profileById(view.selected)
+  renderPeople()
+  renderSettings()
+  renderTabs()
+  renderHeader(profile)
+  renderHistory(profile)
+  if (profile === undefined) {
+    view.shotsFor = null
+    shotsBox.replaceChildren()
+    shotsHint.textContent = 'The newest 24 are kept'
+  } else if (view.shotsFor !== profile.id) {
+    view.shotsFor = profile.id
+    void renderShots(profile)
+  }
+  if (view.tab === 'compare') renderCompare()
+}
+
+/* ---------- selecting and editing people ---------- */
 
 function selectProfile(id) {
   view.selected = id
   renderAll()
+}
+
+function setTab(tab) {
+  view.tab = tab
+  renderTabs()
+  if (tab === 'compare') renderCompare()
+  else renderHistory(profileById(view.selected))
 }
 
 async function rename(id, value) {
@@ -572,7 +863,8 @@ async function rename(id, value) {
   })
   const answer = await response.json().catch(() => ({}))
   if (!response.ok) {
-    flash(answer.error || 'The name was refused.')
+    flash(answer.error || 'That name was refused.')
+    renderHeader(profileById(id))
     return
   }
   const index = view.profiles.findIndex((profile) => profile.id === id)
@@ -583,6 +875,7 @@ async function rename(id, value) {
 async function removeProfile(id) {
   const profile = profileById(id)
   if (profile === undefined) return
+  personMenu.open = false
   if (!confirm(`Delete ${profile.name} and all ${profile.readings.length} of their readings?`)) return
   const response = await fetch(api(`api/profiles/${encodeURIComponent(id)}`), { method: 'DELETE' })
   if (!response.ok) {
@@ -592,15 +885,17 @@ async function removeProfile(id) {
   view.profiles = view.profiles.filter((item) => item.id !== id)
   view.compare.delete(id)
   if (view.selected === id) view.selected = view.profiles[0] ? view.profiles[0].id : null
+  view.shotsFor = null
   renderAll()
 }
 
 async function mergeProfile(from, into) {
   const source = profileById(from)
   const target = profileById(into)
+  personMenu.open = false
   if (source === undefined || target === undefined) return
   if (!confirm(`Merge ${source.name} into ${target.name}? The readings move over and ${source.name} goes away.`)) {
-    renderPeople()
+    renderHeader(source)
     return
   }
   const response = await fetch(api(`api/profiles/${encodeURIComponent(from)}/merge`), {
@@ -618,6 +913,7 @@ async function mergeProfile(from, into) {
   if (index >= 0) view.profiles[index] = answer.profile
   view.compare.delete(from)
   if (view.selected === from) view.selected = into
+  view.shotsFor = null
   renderAll()
 }
 
@@ -774,14 +1070,27 @@ function drawOverlay(result, source, mirror) {
   context.restore()
 }
 
+function showLive(score) {
+  const band = bandOf(score)
+  readout.dataset.band = band.key
+  readout.hidden = false
+  liveScore.textContent = score1(score)
+  liveVerdict.textContent = band.label
+}
+
+function hideLive() {
+  readout.hidden = true
+  readout.dataset.band = 'calm'
+}
+
 function handleDetection(result, source) {
   const mirror = view.mode === 'camera'
   drawOverlay(result, source, mirror)
   if (!result) {
-    badge.hidden = true
+    hideLive()
     view.lastFace = null
     hadFace = false
-    byId('snap').disabled = true
+    snapButton.disabled = true
     renderFactors(null)
     setStatus(view.mode === 'photo' ? 'No face in that picture.' : 'No face in view. Face the camera, in good light.')
     return
@@ -797,11 +1106,10 @@ function handleDetection(result, source) {
   }
   const features = featuresOf(result.landmarks)
   const verdict = weirdness(features)
-  badge.hidden = false
-  liveScore.textContent = score1(verdict.score)
-  renderFactors(verdict.top)
+  showLive(verdict.score)
+  renderFactors(verdict.parts)
   view.lastFace = result
-  byId('snap').disabled = false
+  snapButton.disabled = false
   const { width } = result.detection.box
   const { width: sourceWidth } = sourceSize(source)
   const share = sourceWidth > 0 ? width / sourceWidth : 0
@@ -813,7 +1121,7 @@ function handleDetection(result, source) {
     setStatus(
       view.settings.intervalSec > 0
         ? `Watching: a capture every ${view.settings.intervalSec}s while a face is in view.`
-        : 'Watching: captures only when you press the button.',
+        : 'Watching: captures only when you press the button or C.',
     )
   }
   const due = view.mode === 'camera' && view.settings.intervalSec > 0 && Date.now() - view.lastCaptureAt >= view.settings.intervalSec * 1000
@@ -869,7 +1177,7 @@ async function captureNow() {
   if (!ready(source)) return
   view.capturing = true
   view.lastCaptureAt = Date.now()
-  setStatus('Reading the face...')
+  setStatus('Reading the face…')
   try {
     const result = await view.faceapi.detectSingleFace(source, view.options).withFaceLandmarks().withFaceDescriptor()
     if (!result) {
@@ -910,23 +1218,33 @@ function applyCapture(answer) {
   const index = view.profiles.findIndex((profile) => profile.id === answer.profile.id)
   if (index >= 0) view.profiles[index] = answer.profile
   else view.profiles.push(answer.profile)
-  view.profiles.sort((a, b) => latest(b) - latest(a))
+  view.profiles.sort((a, b) => latestAt(b) - latestAt(a))
   view.selected = answer.profile.id
+  view.tab = 'history'
+  view.shotsFor = null
   renderAll()
   const name = answer.profile.name
   // The sound says what the capture meant: a new face, a personal best, or just another reading of the same face.
   if (answer.created) sounds.newPerson()
   else if (answer.reading.score > previousBest + 0.05) sounds.peak()
   else sounds.capture(answer.reading.score)
+  readout.animate?.(
+    [
+      { transform: 'scale(1)' },
+      { transform: 'scale(1.06)' },
+      { transform: 'scale(1)' },
+    ],
+    { duration: 260, easing: 'ease-out' },
+  )
   flash(
     answer.created
-      ? `A new face: ${name}, weirdness ${score1(answer.reading.score)}. Rename them in the list.`
+      ? `A new face: ${name}, weirdness ${score1(answer.reading.score)}. Rename them on the right.`
       : `${name} again, weirdness ${score1(answer.reading.score)} (face distance ${answer.distance}).`,
   )
   holdStatus(`Saved ${score1(answer.reading.score)} weirdness for ${name}.`)
 }
 
-async function startCamera() {
+function startCamera() {
   if (view.stream !== null) {
     stopCamera()
     return
@@ -935,32 +1253,39 @@ async function startCamera() {
     notice('This page cannot reach a camera: browsers give one only over https or on localhost.')
     return
   }
-  byId('start').disabled = true
+  startButton.disabled = true
+  startLabel.textContent = 'Opening the camera…'
   photo.hidden = true
   video.hidden = false
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 960 }, facingMode: 'user' },
-      audio: false,
-    })
-    view.stream = stream
-    video.srcObject = stream
-    await video.play()
-    view.mode = 'camera'
-    view.running = true
-    view.lastCaptureAt = Date.now()
-    notice('Camera on. Make a face.')
-    byId('start').textContent = 'Stop camera'
-    hadFace = false
-    lastDetectAt = 0
-    sounds.cameraOn()
-    scheduleTick(0)
-  } catch (error) {
-    notice(`Camera: ${describe(error)}`)
-    sounds.error()
-  } finally {
-    byId('start').disabled = false
-  }
+  void (async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 960 }, facingMode: 'user' },
+        audio: false,
+      })
+      view.stream = stream
+      video.srcObject = stream
+      await video.play()
+      view.mode = 'camera'
+      view.running = true
+      view.lastCaptureAt = Date.now()
+      placeholder.hidden = true
+      startLabel.textContent = 'Stop camera'
+      modeLabel.textContent = 'Recording'
+      modeChip.hidden = false
+      hadFace = false
+      lastDetectAt = 0
+      sounds.cameraOn()
+      scheduleTick(0)
+    } catch (error) {
+      placeholder.hidden = false
+      startLabel.textContent = 'Start camera'
+      notice(`Camera: ${describe(error)}`)
+      sounds.error()
+    } finally {
+      startButton.disabled = false
+    }
+  })()
 }
 
 function stopCamera() {
@@ -975,12 +1300,14 @@ function stopCamera() {
   if (view.mode === 'camera') view.mode = null
   if (view.mode !== 'photo') view.running = false
   stopTicking()
-  badge.hidden = true
+  hideLive()
+  modeChip.hidden = true
+  placeholder.hidden = false
   drawOverlay(null, video, false)
   renderFactors(null)
-  notice('Camera off')
-  byId('start').textContent = 'Start camera'
-  byId('snap').disabled = true
+  notice('Camera off. Start the camera, or pick a photo, to read a face.')
+  startLabel.textContent = 'Start camera'
+  snapButton.disabled = true
   if (hadCamera) sounds.cameraOff()
 }
 
@@ -997,12 +1324,13 @@ async function usePhoto(file) {
   }
   video.hidden = true
   photo.hidden = false
+  placeholder.hidden = true
   view.mode = 'photo'
   view.running = true
   view.capturePhoto = true
-  notice('Reading the picture...')
-  byId('start').textContent = 'Start camera'
-  byId('snap').disabled = false
+  modeLabel.textContent = 'Reading a photo'
+  modeChip.hidden = false
+  snapButton.disabled = false
   lastDetectAt = 0
   scheduleTick(0)
   // The blob URL is not needed once the picture has been decoded into the element.
@@ -1026,6 +1354,13 @@ async function saveSettings(patch) {
   const answer = await response.json()
   view.settings = answer.settings
   renderSettings()
+  if (view.mode === 'camera' && view.running) {
+    setStatus(
+      view.settings.intervalSec > 0
+        ? `Watching: a capture every ${view.settings.intervalSec}s while a face is in view.`
+        : 'Watching: captures only when you press the button or C.',
+    )
+  }
 }
 
 /* ---------- boot ---------- */
@@ -1040,60 +1375,58 @@ async function loadState() {
   view.settings = data.settings
   view.profiles = data.profiles
   view.selected = view.profiles.length ? view.profiles[0].id : null
-  renderSettings()
   renderAll()
 }
 
 async function loadModels() {
-  notice('Loading the face models (8 MB, kept on this machine)...')
-  const faceapi = await import('./vendor/face-api.js')
-  const models = new URL('vendor/model', base).href
-  await faceapi.nets.tinyFaceDetector.loadFromUri(models)
-  await faceapi.nets.faceLandmark68Net.loadFromUri(models)
-  await faceapi.nets.faceRecognitionNet.loadFromUri(models)
-  view.faceapi = faceapi
-  view.options = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 })
-  notice('Face models ready. Press Start camera, or pick a photo.')
-  setStatus('Point the camera at a face to begin.')
+  modelChip.textContent = 'Loading face models…'
+  modelChip.hidden = false
+  setStatus('Loading the face models (8 MB, kept on this machine)…')
+  try {
+    const faceapi = await import('./vendor/face-api.js')
+    const models = new URL('vendor/model', base).href
+    await faceapi.nets.tinyFaceDetector.loadFromUri(models)
+    await faceapi.nets.faceLandmark68Net.loadFromUri(models)
+    await faceapi.nets.faceRecognitionNet.loadFromUri(models)
+    view.faceapi = faceapi
+    view.options = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 })
+    modelChip.hidden = true
+    startButton.disabled = false
+    startLabel.textContent = 'Start camera'
+    setStatus('Point the camera at a face to begin.')
+  } catch (error) {
+    modelChip.textContent = 'Face models failed'
+    startLabel.textContent = 'Camera unavailable'
+    setStatus(`The face models could not be loaded: ${describe(error)}. Reload the page to try again.`)
+  }
 }
+
+/* ---------- the things a person does ---------- */
 
 peopleList.addEventListener('click', (event) => {
   const target = event.target
   if (!(target instanceof Element)) return
   const row = target.closest('.person')
   if (!row) return
-  if (target.closest('input, select, button')) return
+  if (target.closest('input')) return
   selectProfile(row.dataset.id)
 })
 
 peopleList.addEventListener('change', (event) => {
   const target = event.target
   if (!(target instanceof Element)) return
+  if (target.dataset.act !== 'compare') return
   const row = target.closest('.person')
   if (!row) return
   const id = row.dataset.id
-  if (target.dataset.act === 'compare') {
-    if (target.checked) view.compare.add(id)
-    else view.compare.delete(id)
-    renderCompare()
-  } else if (target.dataset.act === 'name') {
-    void rename(id, target.value)
-  } else if (target.dataset.act === 'merge') {
-    if (target.value !== '') void mergeProfile(id, target.value)
-  }
-})
-
-peopleList.addEventListener('click', (event) => {
-  const target = event.target
-  if (!(target instanceof Element)) return
-  const drop = target.closest('button[data-act=delete]')
-  if (!drop) return
-  const row = drop.closest('.person')
-  if (row) void removeProfile(row.dataset.id)
+  if (target.checked) view.compare.add(id)
+  else view.compare.delete(id)
+  renderTabs()
+  if (view.tab === 'compare') renderCompare()
 })
 
 byId('start').addEventListener('click', () => {
-  void startCamera()
+  startCamera()
 })
 byId('snap').addEventListener('click', () => {
   void captureNow()
@@ -1126,23 +1459,77 @@ byId('threshold').addEventListener('change', (event) => {
   void saveSettings({ matchThreshold: Number(event.target.value) })
 })
 
+renameInput.addEventListener('change', () => {
+  if (view.selected === null) return
+  const name = renameInput.value.trim()
+  if (name === '' || profileById(view.selected)?.name === name) {
+    renderHeader(profileById(view.selected))
+    return
+  }
+  void rename(view.selected, name)
+})
+renameInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') renameInput.blur()
+})
+
+mergeSelect.addEventListener('change', () => {
+  const into = mergeSelect.value
+  if (view.selected === null || into === '') return
+  void mergeProfile(view.selected, into)
+})
+deleteButton.addEventListener('click', () => {
+  if (view.selected !== null) void removeProfile(view.selected)
+})
+
+tabHistory.addEventListener('click', () => {
+  setTab('history')
+})
+tabCompare.addEventListener('click', () => {
+  setTab('compare')
+})
+for (const tab of [tabHistory, tabCompare]) {
+  tab.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return
+    event.preventDefault()
+    const next = tab === tabHistory ? tabCompare : tabHistory
+    setTab(next === tabCompare ? 'compare' : 'history')
+    next.focus()
+  })
+}
+byId('compare-hint').addEventListener('click', () => {
+  setTab('compare')
+  tabCompare.focus()
+})
+document.addEventListener('click', (event) => {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  if (personMenu.open && !personMenu.contains(target)) personMenu.open = false
+})
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'c' && event.key !== 'C') return
+  if (event.metaKey || event.ctrlKey || event.altKey) return
+  const target = event.target
+  if (target instanceof Element && target.closest('input, select, textarea, [contenteditable]')) return
+  if (snapButton.disabled || view.capturing) return
+  event.preventDefault()
+  void captureNow()
+})
+
 let resizeTimer = 0
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer)
   resizeTimer = setTimeout(() => {
-    renderStats()
-    renderCompare()
+    renderHistory(profileById(view.selected))
+    if (view.tab === 'compare') renderCompare()
   }, 150)
 })
 
+renderFactors(null)
 try {
   await loadState()
 } catch (error) {
   setStatus(`The tracker could not read its readings: ${describe(error)}`)
 }
-try {
-  await loadModels()
-} catch (error) {
-  notice(`The face models could not be loaded: ${describe(error)}`)
-  setStatus('Reload the page to try the face models again.')
-}
+await loadModels()
+

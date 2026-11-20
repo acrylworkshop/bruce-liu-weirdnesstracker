@@ -120,7 +120,7 @@
     {
       "name": "weirdness",
       "origin": "local",
-      "digest": "sha256:f6d947710d25a89126895703d6db1fc42227915dda4a86bf19f9c1cf216650a8",
+      "digest": "sha256:8c331a61ae78052e8c488d12273fb1d9ebb1e0dcc552df494ee77c393bb66716",
       "source": "plugins/weirdness"
     }
   ]
