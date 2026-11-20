@@ -126,6 +126,7 @@ export const page = (version: string) => `<!doctype html>
             </select>
           </label>
           <label>Same person under <input id="threshold" type="range" min="0.3" max="0.8" step="0.01"><output id="threshold-out"></output></label>
+          <button id="sound" type="button" aria-pressed="true">Sound on</button>
         </div>
         <div class="factors" id="factors"></div>
         <p class="status" id="status"></p>

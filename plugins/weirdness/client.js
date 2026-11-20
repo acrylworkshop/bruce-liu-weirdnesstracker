@@ -36,7 +36,7 @@ const historyTitle = byId('history-title')
 const COLORS = ['#7c8cff', '#4dd4ac', '#ffd166', '#ff8fab', '#a78bfa', '#66c2ff']
 
 const view = {
-  settings: { intervalSec: 5, matchThreshold: 0.6 },
+  settings: { intervalSec: 5, matchThreshold: 0.6, sound: true },
   profiles: [],
   selected: null,
   compare: new Set(),
@@ -54,6 +54,8 @@ const view = {
 let timer = 0
 let frameCallback = 0
 let lastDetectAt = 0
+let hadFace = false
+let lastFaceSoundAt = 0
 
 /**
  * Ask for the next look at the camera. In camera mode a video frame callback drives it, because a browser throttles
@@ -138,6 +140,94 @@ function describe(error) {
   if (name === 'NotReadableError') return 'the camera is busy in another app.'
   if (name === 'OverconstrainedError') return 'the camera cannot do the size asked for.'
   return (error && error.message) || String(error)
+}
+
+/* ---------- sound: a few synthesized blips, no files, no libraries ---------- */
+
+let audio = null
+
+/**
+ * The page's audio context, made on the first real click (browsers refuse sound before one) and resumed if the browser
+ * suspended it. Null when this browser has no Web Audio at all: the tracker then simply stays quiet.
+ */
+function audioContext() {
+  if (audio === null) {
+    const Ctor = window.AudioContext || window.webkitAudioContext
+    if (typeof Ctor !== 'function') return null
+    try {
+      audio = new Ctor()
+    } catch {
+      return null
+    }
+  }
+  if (audio.state === 'suspended') audio.resume().catch(() => {})
+  return audio
+}
+
+/** One short note: an oscillator with a click-free envelope, `delay` seconds from now. */
+function beep(frequency, { to = 0, length = 0.1, type = 'triangle', gain = 0.05, delay = 0 } = {}) {
+  if (view.settings.sound !== true) return
+  const context = audioContext()
+  if (context === null) return
+  try {
+    const start = context.currentTime + delay
+    const oscillator = context.createOscillator()
+    const envelope = context.createGain()
+    oscillator.type = type
+    oscillator.frequency.setValueAtTime(frequency, start)
+    if (to > 0) oscillator.frequency.exponentialRampToValueAtTime(to, start + length)
+    envelope.gain.setValueAtTime(0.0001, start)
+    envelope.gain.exponentialRampToValueAtTime(gain, start + 0.012)
+    envelope.gain.exponentialRampToValueAtTime(0.0001, start + length)
+    oscillator.connect(envelope).connect(context.destination)
+    oscillator.start(start)
+    oscillator.stop(start + length + 0.03)
+  } catch {
+    // Sound that cannot play is never a reason to lose a capture.
+  }
+}
+
+/**
+ * The tracker's voice: a capture is two notes whose pitch rises with the weirdness, a new face is a three note chime, a
+ * new personal best is an upward fanfare, a face arriving gets a soft ping, and the camera opens and closes with a sweep.
+ */
+const sounds = {
+  capture(score) {
+    const base = 280 + Math.min(100, Math.max(0, score)) * 6
+    beep(base, { length: 0.09, gain: 0.05 })
+    beep(base * 1.5, { length: 0.11, gain: 0.045, delay: 0.075 })
+  },
+  newPerson() {
+    beep(523, { length: 0.1, gain: 0.05 })
+    beep(659, { length: 0.1, gain: 0.05, delay: 0.09 })
+    beep(784, { length: 0.15, gain: 0.05, delay: 0.18 })
+  },
+  peak() {
+    beep(784, { length: 0.09, gain: 0.055 })
+    beep(988, { length: 0.09, gain: 0.05, delay: 0.08 })
+    beep(1319, { length: 0.17, gain: 0.045, delay: 0.16 })
+  },
+  error() {
+    beep(180, { length: 0.09, type: 'square', gain: 0.035 })
+    beep(140, { length: 0.12, type: 'square', gain: 0.035, delay: 0.1 })
+  },
+  cameraOn() {
+    beep(260, { to: 560, length: 0.22, type: 'sine', gain: 0.045 })
+  },
+  cameraOff() {
+    beep(420, { to: 200, length: 0.2, type: 'sine', gain: 0.04 })
+  },
+  faceFound() {
+    beep(1180, { length: 0.06, type: 'sine', gain: 0.02 })
+  },
+}
+
+function renderSound() {
+  const button = byId('sound')
+  if (!button) return
+  const on = view.settings.sound === true
+  button.textContent = on ? 'Sound on' : 'Sound off'
+  button.setAttribute('aria-pressed', on ? 'true' : 'false')
 }
 
 /* ---------- charts ---------- */
@@ -464,6 +554,7 @@ function renderSettings() {
   const threshold = byId('threshold')
   threshold.value = String(view.settings.matchThreshold)
   byId('threshold-out').textContent = view.settings.matchThreshold.toFixed(2)
+  renderSound()
 }
 
 /* ---------- profiles ---------- */
@@ -689,10 +780,20 @@ function handleDetection(result, source) {
   if (!result) {
     badge.hidden = true
     view.lastFace = null
+    hadFace = false
     byId('snap').disabled = true
     renderFactors(null)
     setStatus(view.mode === 'photo' ? 'No face in that picture.' : 'No face in view. Face the camera, in good light.')
     return
+  }
+  if (!hadFace) {
+    hadFace = true
+    // A soft ping when a face arrives, at most once every ten seconds: flickering detection is not a chime.
+    const now = Date.now()
+    if (now - lastFaceSoundAt > 10_000) {
+      lastFaceSoundAt = now
+      sounds.faceFound()
+    }
   }
   const features = featuresOf(result.landmarks)
   const verdict = weirdness(features)
@@ -772,12 +873,14 @@ async function captureNow() {
   try {
     const result = await view.faceapi.detectSingleFace(source, view.options).withFaceLandmarks().withFaceDescriptor()
     if (!result) {
+      sounds.error()
       holdStatus('No face in view, so nothing was saved.')
       return
     }
     const features = featuresOf(result.landmarks)
     const descriptor = Array.from(result.descriptor)
     if (descriptor.length !== 128) {
+      sounds.error()
       holdStatus('The face signature could not be read this time.')
       return
     }
@@ -788,11 +891,13 @@ async function captureNow() {
     })
     const answer = await response.json().catch(() => ({}))
     if (!response.ok) {
+      sounds.error()
       holdStatus(answer.error || 'The capture was refused.')
       return
     }
     applyCapture(answer)
   } catch (error) {
+    sounds.error()
     holdStatus(`Capture failed: ${describe(error)}`)
   } finally {
     view.capturing = false
@@ -800,6 +905,8 @@ async function captureNow() {
 }
 
 function applyCapture(answer) {
+  const previous = view.profiles.find((profile) => profile.id === answer.profile.id)
+  const previousBest = previous === undefined ? 0 : previous.readings.reduce((best, [, score]) => Math.max(best, score), 0)
   const index = view.profiles.findIndex((profile) => profile.id === answer.profile.id)
   if (index >= 0) view.profiles[index] = answer.profile
   else view.profiles.push(answer.profile)
@@ -807,6 +914,10 @@ function applyCapture(answer) {
   view.selected = answer.profile.id
   renderAll()
   const name = answer.profile.name
+  // The sound says what the capture meant: a new face, a personal best, or just another reading of the same face.
+  if (answer.created) sounds.newPerson()
+  else if (answer.reading.score > previousBest + 0.05) sounds.peak()
+  else sounds.capture(answer.reading.score)
   flash(
     answer.created
       ? `A new face: ${name}, weirdness ${score1(answer.reading.score)}. Rename them in the list.`
@@ -840,22 +951,27 @@ async function startCamera() {
     view.lastCaptureAt = Date.now()
     notice('Camera on. Make a face.')
     byId('start').textContent = 'Stop camera'
+    hadFace = false
     lastDetectAt = 0
+    sounds.cameraOn()
     scheduleTick(0)
   } catch (error) {
     notice(`Camera: ${describe(error)}`)
+    sounds.error()
   } finally {
     byId('start').disabled = false
   }
 }
 
 function stopCamera() {
+  const hadCamera = view.stream !== null
   if (view.stream !== null) {
     for (const track of view.stream.getTracks()) track.stop()
     view.stream = null
   }
   video.srcObject = null
   view.lastFace = null
+  hadFace = false
   if (view.mode === 'camera') view.mode = null
   if (view.mode !== 'photo') view.running = false
   stopTicking()
@@ -865,6 +981,7 @@ function stopCamera() {
   notice('Camera off')
   byId('start').textContent = 'Start camera'
   byId('snap').disabled = true
+  if (hadCamera) sounds.cameraOff()
 }
 
 async function usePhoto(file) {
@@ -985,6 +1102,20 @@ byId('file').addEventListener('change', (event) => {
   const file = event.target.files && event.target.files[0]
   if (file) void usePhoto(file)
 })
+byId('sound').addEventListener('click', () => {
+  // This click is the gesture a browser needs before it will make a sound.
+  audioContext()
+  const on = view.settings.sound !== true
+  void saveSettings({ sound: on })
+  if (on) sounds.capture(30)
+})
+document.addEventListener(
+  'pointerdown',
+  () => {
+    audioContext()
+  },
+  { once: true },
+)
 byId('interval').addEventListener('change', (event) => {
   void saveSettings({ intervalSec: Number(event.target.value) })
 })

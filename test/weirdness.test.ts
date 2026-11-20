@@ -103,6 +103,7 @@ test('the page, the client modules and the vendored face bundle are served', () 
     const html = await page.text()
     assert.match(html, /<h1>Weirdness tracker<\/h1>/)
     assert.match(html, /client\.js\?v=[0-9a-f]{12}/, 'the page boots the client module under a version digest')
+    assert.match(html, /id="sound"/, 'the page has the sound switch')
 
     const client = await app.root.router.request('/weirdness/client.js')
     assert.equal(client.status, 200)
@@ -145,7 +146,7 @@ test('a capture scores a face, starts a profile and records it; the same face co
   withApp(async (app) => {
     const state = await app.root.router.request('/weirdness/api/state')
     assert.deepEqual(await state.json(), {
-      settings: { intervalSec: 5, matchThreshold: 0.6 },
+      settings: { intervalSec: 5, matchThreshold: 0.6, sound: true },
       profiles: [],
     })
 
@@ -231,6 +232,7 @@ test('people can be renamed, merged and deleted, and the settings stick', () =>
     assert.deepEqual(((await settings.json()) as { settings: unknown }).settings, {
       intervalSec: 15,
       matchThreshold: 0.4,
+      sound: true,
     })
     const badSetting = await app.root.router.request('/weirdness/api/settings', {
       method: 'POST',
@@ -238,6 +240,20 @@ test('people can be renamed, merged and deleted, and the settings stick', () =>
       body: JSON.stringify({ matchThreshold: 3 }),
     })
     assert.equal(badSetting.status, 400)
+
+    const muted = await app.root.router.request('/weirdness/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sound: false }),
+    })
+    assert.equal(muted.status, 200)
+    assert.equal(((await muted.json()) as { settings: { sound: boolean } }).settings.sound, false)
+    const notABoolean = await app.root.router.request('/weirdness/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sound: 'quiet' }),
+    })
+    assert.equal(notABoolean.status, 400)
 
     const merge = await app.root.router.request(`/weirdness/api/profiles/${two.profile.id}/merge`, {
       method: 'POST',

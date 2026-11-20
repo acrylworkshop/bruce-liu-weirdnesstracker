@@ -46,6 +46,8 @@ export interface Settings {
   intervalSec: number
   /** Descriptor distance under which a face is the same person (0.4 is strict, 0.6 is loose). */
   matchThreshold: number
+  /** Whether the page plays a sound for a capture, a new face and a new personal best. */
+  sound: boolean
 }
 
 export interface State {
@@ -82,17 +84,17 @@ export interface Store {
 }
 
 /** The threshold face-api's own models are documented around: 0.6 reads two pictures of one face as the same person. */
-const DEFAULT_SETTINGS: Settings = { intervalSec: 5, matchThreshold: 0.6 }
+const DEFAULT_SETTINGS: Settings = { intervalSec: 5, matchThreshold: 0.6, sound: true }
 const MAX_SHOT_BYTES = 200_000
 const MAX_NAME = 40
 
 export const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value)
 
-/** A settings patch, or null when a value is out of range: the interval 0..600 seconds (0 captures by hand only), the threshold 0.2..0.9. */
+/** A settings patch, or null when a value is out of range: the interval 0..600 seconds (0 captures by hand only), the threshold 0.2..0.9, sound on or off. */
 export function readSettings(input: unknown): Partial<Settings> | null {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) return null
-  const patch: { intervalSec?: number; matchThreshold?: number } = {}
+  const patch: { intervalSec?: number; matchThreshold?: number; sound?: boolean } = {}
   for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
     if (key === 'intervalSec') {
       if (!isFiniteNumber(value) || value < 0 || value > 600) return null
@@ -100,6 +102,9 @@ export function readSettings(input: unknown): Partial<Settings> | null {
     } else if (key === 'matchThreshold') {
       if (!isFiniteNumber(value) || value < 0.2 || value > 0.9) return null
       patch.matchThreshold = Math.round(value * 100) / 100
+    } else if (key === 'sound') {
+      if (typeof value !== 'boolean') return null
+      patch.sound = value
     } else {
       return null
     }
