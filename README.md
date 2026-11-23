@@ -1,3 +1,9 @@
+![WeirdnessTracker: the camera scores how weird your face looks](docs/workshop-screenshot.png)
+
+**WeirdnessTracker by Brucey (Yi Yu Bruce Liu)**, built at the [ACRYL Bootcamp](https://github.com/acrylworkshop/bootcamp-2026-11-20), Vienna, 20 November 2026.
+
+---
+
 # weirdnesstracker
 
 A Cordis app on Node, scaffolded by `acrylblends init`. TypeScript, run by Node with no build step. Every part is a
